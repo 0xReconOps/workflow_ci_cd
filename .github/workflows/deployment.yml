@@ -1,0 +1,144 @@
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: self-hosted
+
+    steps:
+      - name: Check the code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+
+      - name: Install test environment
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: '24'
+
+      - name: Validate the HTML syntax
+        run: npx htmlhint "**/*.html"
+
+      - name: Validate the JavaScript syntax
+        run: find . -name "*.js" -not -path "*/node_modules/*" -exec node --check {} \;
+      
+      - name: Analyse SonarQube
+        uses: SonarSource/sonarqube-scan-action@7006c4492b2e0ee0f816d36501671557c97f5995 # v8.1.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        
+      - name: Run SonarQube Quality Gate
+        uses: SonarSource/sonarqube-quality-gate-action@cf038b0e0cdecfa9e56c198bbb7d21d751d62c3b # v1.2.0
+        timeout-minutes: 5
+        env:
+            SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  build:
+    runs-on: ubuntu-24.04
+    needs: test
+
+    steps:
+      - name: Récupérer le code du projet
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Configurer Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Construire l'image Docker
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          load: true
+          tags: mon-site-html:latest
+      
+      - name: Exporter l'image en fichier tar
+        run: docker save mon-site-html:latest -o /tmp/mon-site-html.tar
+
+      - name: Uploader l'image Docker en artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: /tmp/mon-site-html.tar
+
+  check_security:
+    runs-on: ubuntu-24.04
+    needs:  build
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Scanner le code et les fichiers
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'table'
+          exit-code: '1' # Bloque le pipeline si une faille grave est trouvée
+          severity: 'CRITICAL,HIGH'
+
+  deploy:
+    runs-on: self-hosted
+    needs: check_security
+    steps:
+      - name: Télécharger l'image Docker archivée
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+          path: /tmp
+
+      - name: Récupérer l'IP locale du runner
+        id: local_ip
+        run: |
+          RUNNER_IP=$(hostname -I | awk '{print $1}')
+          echo "L'adresse IP locale de ce runner est : $RUNNER_IP"
+          echo "ip=$RUNNER_IP" >> $GITHUB_OUTPUT
+
+      - name: Charger l'image Docker
+        run: docker load --input /tmp/mon-site-html.tar
+
+      - name: Nettoyer un ancien conteneur éventuel
+        run: |
+          docker stop conteneur-site 2>/dev/null || true
+          docker rm conteneur-site 2>/dev/null || true
+
+      - name: Déployer et démarrer le conteneur
+        run: |
+          docker run -d \
+            -p 0.0.0.0:8080:80 \
+            --name conteneur-site \
+            mon-site-html:latest
+
+      - name: Valider l'accès via l'IP et le Port
+        run: |
+          sleep 3
+          echo "Site accessible sur : http://${{ steps.local_ip.outputs.ip }}:8080"
+          curl -v http://${{ steps.local_ip.outputs.ip }}:8080
+
+  owasp_zap_scan:
+    runs-on: self-hosted
+    needs: deploy
+    timeout-minutes: 15
+
+    steps:
+      - name: Scan dynamique OWASP ZAP
+        uses: zaproxy/action-baseline@v0.14.0
+        with:
+          target: 'http://172.20.20.23:8080'
+          fail_action: true
+          cmd_options: '-m 3'
+
+      - name: Uploader le rapport ZAP
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-scan-report
+          path: report_html.html
+
