@@ -1,0 +1,14 @@
+deploy:
+    runs-on: ubuntu-24.04
+    needs: build
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Upload Production Artifacts
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: '.' 
+
+      - name: Deploy to GitHub Pages
+        uses: actions/deploy-pages@v4
